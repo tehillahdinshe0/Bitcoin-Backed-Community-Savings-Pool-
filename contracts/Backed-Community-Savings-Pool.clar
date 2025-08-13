@@ -8,6 +8,8 @@
 (define-constant ERR-INSUFFICIENT-TIER (err u107))
 (define-constant ERR-PROPOSAL-NOT-FOUND (err u108))
 (define-constant ERR-ALREADY-VOTED (err u109))
+(define-constant ERR-EMERGENCY-COOLDOWN (err u110))
+(define-constant ERR-INSUFFICIENT-DEPOSIT (err u111))
 
 (define-constant MIN-DEPOSIT-AMOUNT u100000)
 (define-constant BRONZE-MIN u1000000)
@@ -24,6 +26,12 @@
 (define-constant INTEREST-RATE u5)
 (define-constant BLOCKS-PER-CYCLE u1000)
 (define-constant PROPOSAL-DURATION u1008)
+(define-constant EMERGENCY-COOLDOWN u1008)
+
+(define-constant BRONZE-PENALTY u30)
+(define-constant SILVER-PENALTY u25)
+(define-constant GOLD-PENALTY u15)
+(define-constant PLATINUM-PENALTY u10)
 
 (define-data-var pool-active bool false)
 (define-data-var total-deposits uint u0)
@@ -43,7 +51,8 @@
     deposit-blocks: uint,
     accumulated-interest: uint,
     tier: uint,
-    voting-power: uint
+    voting-power: uint,
+    last-emergency-withdrawal: uint
   }
 )
 
@@ -95,6 +104,15 @@
         u2
         u1))))
 
+(define-private (get-emergency-penalty (tier uint))
+  (if (is-eq tier u4)
+    PLATINUM-PENALTY
+    (if (is-eq tier u3)
+      GOLD-PENALTY
+      (if (is-eq tier u2)
+        SILVER-PENALTY
+        BRONZE-PENALTY))))
+
 (define-public (join-pool (initial-deposit uint))
   (begin
     (asserts! (var-get pool-active) ERR-POOL-INACTIVE)
@@ -112,7 +130,8 @@
           deposit-blocks: u0,
           accumulated-interest: u0,
           tier: member-tier,
-          voting-power: voting-power
+          voting-power: voting-power,
+          last-emergency-withdrawal: u0
         })
       (map-set deposit-history tx-sender (list {amount: initial-deposit, block-height: stacks-block-height}))
       (var-set member-count (+ (var-get member-count) u1))
@@ -188,6 +207,29 @@
     (var-set current-rotation (+ (var-get current-rotation) u1))
     (ok true)))
 
+(define-public (emergency-withdrawal (amount uint))
+  (let ((member-data (unwrap! (map-get? pool-members tx-sender) ERR-NOT-MEMBER))
+        (member-tier (get tier member-data))
+        (total-deposited (get total-deposited member-data))
+        (last-emergency (get last-emergency-withdrawal member-data)))
+    (asserts! (> total-deposited u0) ERR-INSUFFICIENT-DEPOSIT)
+    (asserts! (>= total-deposited amount) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (>= (- stacks-block-height last-emergency) EMERGENCY-COOLDOWN) ERR-EMERGENCY-COOLDOWN)
+    (let ((penalty-rate (get-emergency-penalty member-tier))
+          (penalty-amount (/ (* amount penalty-rate) u100))
+          (withdrawal-amount (- amount penalty-amount)))
+      (try! (as-contract (stx-transfer? withdrawal-amount (as-contract tx-sender) tx-sender)))
+      (map-set pool-members tx-sender
+        (merge member-data
+          {
+            total-deposited: (- total-deposited amount),
+            last-emergency-withdrawal: stacks-block-height,
+            deposit-blocks: (- (get deposit-blocks member-data) (* amount (- stacks-block-height (get joined-height member-data))))
+          }))
+      (var-set total-deposits (- (var-get total-deposits) amount))
+      (var-set interest-pool (+ (var-get interest-pool) penalty-amount))
+      (ok {withdrawal: withdrawal-amount, penalty: penalty-amount}))))
+
 (define-public (create-proposal (title (string-ascii 50)) (description (string-ascii 200)) (proposal-type uint))
   (let ((member-data (unwrap! (map-get? pool-members tx-sender) ERR-NOT-MEMBER))
         (proposal-id (+ (var-get proposal-count) u1)))
@@ -227,7 +269,7 @@
   (let ((member-data (default-to 
                        {joined-height: u0, total-deposited: u0, withdrawal-status: false, 
                         last-withdrawal-height: u0, deposit-blocks: u0, accumulated-interest: u0,
-                        tier: u1, voting-power: u0}
+                        tier: u1, voting-power: u0, last-emergency-withdrawal: u0}
                        (map-get? pool-members member))))
     (if (> (get deposit-blocks member-data) u0)
         (/ (* (var-get interest-pool) (get deposit-blocks member-data)) 
@@ -238,7 +280,7 @@
   (get deposit-blocks (default-to 
                         {joined-height: u0, total-deposited: u0, withdrawal-status: false,
                          last-withdrawal-height: u0, deposit-blocks: u0, accumulated-interest: u0,
-                         tier: u1, voting-power: u0}
+                         tier: u1, voting-power: u0, last-emergency-withdrawal: u0}
                         (map-get? pool-members member))))
 
 (define-read-only (get-pool-info)
@@ -264,3 +306,15 @@
 
 (define-read-only (get-proposal-info (proposal-id uint))
   (ok (unwrap! (map-get? governance-proposals proposal-id) ERR-PROPOSAL-NOT-FOUND)))
+
+(define-read-only (get-emergency-withdrawal-info (member principal))
+  (let ((member-data (unwrap! (map-get? pool-members member) ERR-NOT-MEMBER))
+        (member-tier (get tier member-data))
+        (last-emergency (get last-emergency-withdrawal member-data)))
+    (ok {
+      penalty-rate: (get-emergency-penalty member-tier),
+      cooldown-remaining: (if (>= (- stacks-block-height last-emergency) EMERGENCY-COOLDOWN) 
+                            u0 
+                            (- EMERGENCY-COOLDOWN (- stacks-block-height last-emergency))),
+      eligible: (>= (- stacks-block-height last-emergency) EMERGENCY-COOLDOWN)
+    })))
