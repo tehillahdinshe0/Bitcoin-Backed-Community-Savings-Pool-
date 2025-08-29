@@ -10,6 +10,8 @@
 (define-constant ERR-ALREADY-VOTED (err u109))
 (define-constant ERR-EMERGENCY-COOLDOWN (err u110))
 (define-constant ERR-INSUFFICIENT-DEPOSIT (err u111))
+(define-constant ERR-INVALID-REFERRER (err u112))
+(define-constant ERR-NO-REFERRAL-REWARDS (err u113))
 
 (define-constant MIN-DEPOSIT-AMOUNT u100000)
 (define-constant BRONZE-MIN u1000000)
@@ -33,6 +35,11 @@
 (define-constant GOLD-PENALTY u15)
 (define-constant PLATINUM-PENALTY u10)
 
+(define-constant BRONZE-REFERRAL u2)
+(define-constant SILVER-REFERRAL u3)
+(define-constant GOLD-REFERRAL u4)
+(define-constant PLATINUM-REFERRAL u5)
+
 (define-data-var pool-active bool false)
 (define-data-var total-deposits uint u0)
 (define-data-var current-rotation uint u0)
@@ -52,7 +59,10 @@
     accumulated-interest: uint,
     tier: uint,
     voting-power: uint,
-    last-emergency-withdrawal: uint
+    last-emergency-withdrawal: uint,
+    referrer: (optional principal),
+    referral-rewards: uint,
+    total-referrals: uint
   }
 )
 
@@ -113,6 +123,15 @@
         SILVER-PENALTY
         BRONZE-PENALTY))))
 
+(define-private (get-referral-rate (tier uint))
+  (if (is-eq tier u4)
+    PLATINUM-REFERRAL
+    (if (is-eq tier u3)
+      GOLD-REFERRAL
+      (if (is-eq tier u2)
+        SILVER-REFERRAL
+        BRONZE-REFERRAL))))
+
 (define-public (join-pool (initial-deposit uint))
   (begin
     (asserts! (var-get pool-active) ERR-POOL-INACTIVE)
@@ -131,8 +150,51 @@
           accumulated-interest: u0,
           tier: member-tier,
           voting-power: voting-power,
-          last-emergency-withdrawal: u0
+          last-emergency-withdrawal: u0,
+          referrer: none,
+          referral-rewards: u0,
+          total-referrals: u0
         })
+      (map-set deposit-history tx-sender (list {amount: initial-deposit, block-height: stacks-block-height}))
+      (var-set member-count (+ (var-get member-count) u1))
+      (var-set total-deposits (+ (var-get total-deposits) initial-deposit))
+      (ok member-tier))))
+
+(define-public (join-pool-with-referrer (initial-deposit uint) (referrer-address principal))
+  (begin
+    (asserts! (var-get pool-active) ERR-POOL-INACTIVE)
+    (asserts! (is-none (map-get? pool-members tx-sender)) ERR-ALREADY-MEMBER)
+    (asserts! (>= initial-deposit BRONZE-MIN) ERR-INVALID-AMOUNT)
+    (asserts! (is-some (map-get? pool-members referrer-address)) ERR-INVALID-REFERRER)
+    (asserts! (not (is-eq tx-sender referrer-address)) ERR-INVALID-REFERRER)
+    (let ((member-tier (determine-tier initial-deposit))
+          (voting-power (get governance-weight (unwrap-panic (map-get? tier-benefits member-tier))))
+          (referrer-data (unwrap-panic (map-get? pool-members referrer-address)))
+          (referrer-tier (get tier referrer-data))
+          (referral-rate (get-referral-rate referrer-tier))
+          (referral-reward (/ (* initial-deposit referral-rate) u100)))
+      (try! (stx-transfer? initial-deposit tx-sender (as-contract tx-sender)))
+      (map-set pool-members tx-sender
+        {
+          joined-height: stacks-block-height,
+          total-deposited: initial-deposit,
+          withdrawal-status: false,
+          last-withdrawal-height: u0,
+          deposit-blocks: u0,
+          accumulated-interest: u0,
+          tier: member-tier,
+          voting-power: voting-power,
+          last-emergency-withdrawal: u0,
+          referrer: (some referrer-address),
+          referral-rewards: u0,
+          total-referrals: u0
+        })
+      (map-set pool-members referrer-address
+        (merge referrer-data
+          {
+            referral-rewards: (+ (get referral-rewards referrer-data) referral-reward),
+            total-referrals: (+ (get total-referrals referrer-data) u1)
+          }))
       (map-set deposit-history tx-sender (list {amount: initial-deposit, block-height: stacks-block-height}))
       (var-set member-count (+ (var-get member-count) u1))
       (var-set total-deposits (+ (var-get total-deposits) initial-deposit))
@@ -230,6 +292,16 @@
       (var-set interest-pool (+ (var-get interest-pool) penalty-amount))
       (ok {withdrawal: withdrawal-amount, penalty: penalty-amount}))))
 
+(define-public (claim-referral-rewards)
+  (let ((member-data (unwrap! (map-get? pool-members tx-sender) ERR-NOT-MEMBER))
+        (reward-amount (get referral-rewards member-data)))
+    (asserts! (> reward-amount u0) ERR-NO-REFERRAL-REWARDS)
+    (try! (as-contract (stx-transfer? reward-amount (as-contract tx-sender) tx-sender)))
+    (map-set pool-members tx-sender
+      (merge member-data
+        { referral-rewards: u0 }))
+    (ok reward-amount)))
+
 (define-public (create-proposal (title (string-ascii 50)) (description (string-ascii 200)) (proposal-type uint))
   (let ((member-data (unwrap! (map-get? pool-members tx-sender) ERR-NOT-MEMBER))
         (proposal-id (+ (var-get proposal-count) u1)))
@@ -269,7 +341,8 @@
   (let ((member-data (default-to 
                        {joined-height: u0, total-deposited: u0, withdrawal-status: false, 
                         last-withdrawal-height: u0, deposit-blocks: u0, accumulated-interest: u0,
-                        tier: u1, voting-power: u0, last-emergency-withdrawal: u0}
+                        tier: u1, voting-power: u0, last-emergency-withdrawal: u0,
+                        referrer: none, referral-rewards: u0, total-referrals: u0}
                        (map-get? pool-members member))))
     (if (> (get deposit-blocks member-data) u0)
         (/ (* (var-get interest-pool) (get deposit-blocks member-data)) 
@@ -280,7 +353,8 @@
   (get deposit-blocks (default-to 
                         {joined-height: u0, total-deposited: u0, withdrawal-status: false,
                          last-withdrawal-height: u0, deposit-blocks: u0, accumulated-interest: u0,
-                         tier: u1, voting-power: u0, last-emergency-withdrawal: u0}
+                         tier: u1, voting-power: u0, last-emergency-withdrawal: u0,
+                         referrer: none, referral-rewards: u0, total-referrals: u0}
                         (map-get? pool-members member))))
 
 (define-read-only (get-pool-info)
@@ -317,4 +391,14 @@
                             u0 
                             (- EMERGENCY-COOLDOWN (- stacks-block-height last-emergency))),
       eligible: (>= (- stacks-block-height last-emergency) EMERGENCY-COOLDOWN)
+    })))
+
+(define-read-only (get-referral-info (member principal))
+  (let ((member-data (unwrap! (map-get? pool-members member) ERR-NOT-MEMBER))
+        (member-tier (get tier member-data)))
+    (ok {
+      referrer: (get referrer member-data),
+      referral-rewards: (get referral-rewards member-data),
+      total-referrals: (get total-referrals member-data),
+      referral-rate: (get-referral-rate member-tier)
     })))
