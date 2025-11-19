@@ -42,6 +42,15 @@
 (define-constant GOLD-REFERRAL u4)
 (define-constant PLATINUM-REFERRAL u5)
 
+(define-constant LOCK-REWARD-MULTIPLIER-1 u110)
+(define-constant LOCK-REWARD-MULTIPLIER-2 u120)
+(define-constant LOCK-REWARD-MULTIPLIER-3 u135)
+(define-constant LOCK-REWARD-MULTIPLIER-4 u150)
+(define-constant LOCK-PERIOD-TIER-1 u4320)
+(define-constant LOCK-PERIOD-TIER-2 u8640)
+(define-constant LOCK-PERIOD-TIER-3 u17280)
+(define-constant LOCK-PERIOD-TIER-4 u34560)
+
 (define-data-var pool-active bool false)
 (define-data-var total-deposits uint u0)
 (define-data-var current-rotation uint u0)
@@ -68,7 +77,10 @@
     last-emergency-withdrawal: uint,
     referrer: (optional principal),
     referral-rewards: uint,
-    total-referrals: uint
+    total-referrals: uint,
+    locked-amount: uint,
+    lock-expiry-height: uint,
+    lock-tier: uint
   }
 )
 
@@ -176,6 +188,24 @@
         SILVER-REFERRAL
         BRONZE-REFERRAL))))
 
+(define-private (get-lock-multiplier (lock-tier uint))
+  (if (is-eq lock-tier u4)
+    LOCK-REWARD-MULTIPLIER-4
+    (if (is-eq lock-tier u3)
+      LOCK-REWARD-MULTIPLIER-3
+      (if (is-eq lock-tier u2)
+        LOCK-REWARD-MULTIPLIER-2
+        LOCK-REWARD-MULTIPLIER-1))))
+
+(define-private (get-lock-period (lock-tier uint))
+  (if (is-eq lock-tier u4)
+    LOCK-PERIOD-TIER-4
+    (if (is-eq lock-tier u3)
+      LOCK-PERIOD-TIER-3
+      (if (is-eq lock-tier u2)
+        LOCK-PERIOD-TIER-2
+        LOCK-PERIOD-TIER-1))))
+
 ;; === ANALYTICS PRIVATE FUNCTIONS ===
 (define-private (record-transaction)
   (begin
@@ -241,7 +271,10 @@
           last-emergency-withdrawal: u0,
           referrer: none,
           referral-rewards: u0,
-          total-referrals: u0
+          total-referrals: u0,
+          locked-amount: u0,
+          lock-expiry-height: u0,
+          lock-tier: u0
         })
       (map-set deposit-history tx-sender (list {amount: initial-deposit, block-height: stacks-block-height}))
       (var-set member-count (+ (var-get member-count) u1))
@@ -278,7 +311,10 @@
           last-emergency-withdrawal: u0,
           referrer: (some referrer-address),
           referral-rewards: u0,
-          total-referrals: u0
+          total-referrals: u0,
+          locked-amount: u0,
+          lock-expiry-height: u0,
+          lock-tier: u0
         })
       (map-set pool-members referrer-address
         (merge referrer-data
@@ -317,6 +353,23 @@
       (update-member-monthly-analytics tx-sender amount "deposit")
       (ok new-tier))))
 
+(define-read-only (calculate-interest-share (member principal))
+  (let ((member-data (default-to 
+                       {joined-height: u0, total-deposited: u0, withdrawal-status: false, 
+                        last-withdrawal-height: u0, deposit-blocks: u0, accumulated-interest: u0,
+                        tier: u1, voting-power: u0, last-emergency-withdrawal: u0,
+                        referrer: none, referral-rewards: u0, total-referrals: u0,
+                        locked-amount: u0, lock-expiry-height: u0, lock-tier: u0}
+                       (map-get? pool-members member))))
+    (let ((base (if (> (get deposit-blocks member-data) u0)
+                  (/ (* (var-get interest-pool) (get deposit-blocks member-data)) (var-get total-deposits))
+                  u0))
+          (active-lock (and (> (get locked-amount member-data) u0)
+                            (< stacks-block-height (get lock-expiry-height member-data)))))
+      (if active-lock
+        (/ (* base (get-lock-multiplier (get lock-tier member-data))) u100)
+        base))))
+
 (define-public (distribute-interest)
   (begin
     (asserts! (>= (- stacks-block-height (var-get last-interest-distribution)) BLOCKS-PER-CYCLE) ERR-POOL-LOCKED)
@@ -347,9 +400,12 @@
 
 (define-public (process-withdrawal)
   (let ((member-data (unwrap! (map-get? pool-members tx-sender) ERR-NOT-MEMBER))
-        (withdrawal-amount (get total-deposited member-data)))
+        (withdrawal-amount (get total-deposited member-data))
+        (active-lock (and (> (get locked-amount member-data) u0)
+                          (< stacks-block-height (get lock-expiry-height member-data)))))
     (asserts! (get withdrawal-status member-data) ERR-NOT-AUTHORIZED)
     (asserts! (>= stacks-block-height (+ (var-get lock-height) LOCK-PERIOD)) ERR-POOL-LOCKED)
+    (asserts! (not active-lock) ERR-POOL-LOCKED)
     (try! (as-contract (stx-transfer? withdrawal-amount (as-contract tx-sender) tx-sender)))
     (map-set pool-members tx-sender
       (merge member-data 
@@ -398,6 +454,43 @@
       (merge member-data
         { referral-rewards: u0 }))
     (ok reward-amount)))
+
+(define-public (lock-deposit (lock-amount uint) (lock-tier-level uint))
+  (let ((member-data (unwrap! (map-get? pool-members tx-sender) ERR-NOT-MEMBER))
+        (current-total-deposited (get total-deposited member-data))
+        (lock-period (get-lock-period lock-tier-level)))
+    (asserts! (and (>= lock-tier-level u1) (<= lock-tier-level u4)) ERR-INVALID-AMOUNT)
+    (asserts! (> lock-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (<= lock-amount current-total-deposited) ERR-INSUFFICIENT-BALANCE)
+    (asserts! (is-eq (get locked-amount member-data) u0) ERR-POOL-LOCKED)
+    (map-set pool-members tx-sender
+      (merge member-data
+        {
+          locked-amount: lock-amount,
+          lock-expiry-height: (+ stacks-block-height lock-period),
+          lock-tier: lock-tier-level
+        }))
+    (ok {
+      locked-amount: lock-amount,
+      lock-expiry-height: (+ stacks-block-height lock-period),
+      lock-tier: lock-tier-level,
+      reward-multiplier: (get-lock-multiplier lock-tier-level)
+    })))
+
+(define-public (unlock-deposit)
+  (let ((member-data (unwrap! (map-get? pool-members tx-sender) ERR-NOT-MEMBER))
+        (locked-amount (get locked-amount member-data))
+        (lock-expiry (get lock-expiry-height member-data)))
+    (asserts! (> locked-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (>= stacks-block-height lock-expiry) ERR-POOL-LOCKED)
+    (map-set pool-members tx-sender
+      (merge member-data
+        {
+          locked-amount: u0,
+          lock-expiry-height: u0,
+          lock-tier: u0
+        }))
+    (ok true)))
 
 ;; === ANALYTICS PUBLIC FUNCTIONS ===
 (define-public (generate-performance-report (period-id uint))
@@ -460,24 +553,13 @@
             { votes-against: (+ (get votes-against proposal-data) voting-power) })))
       (ok true))))
 
-(define-read-only (calculate-interest-share (member principal))
-  (let ((member-data (default-to 
-                       {joined-height: u0, total-deposited: u0, withdrawal-status: false, 
-                        last-withdrawal-height: u0, deposit-blocks: u0, accumulated-interest: u0,
-                        tier: u1, voting-power: u0, last-emergency-withdrawal: u0,
-                        referrer: none, referral-rewards: u0, total-referrals: u0}
-                       (map-get? pool-members member))))
-    (if (> (get deposit-blocks member-data) u0)
-        (/ (* (var-get interest-pool) (get deposit-blocks member-data)) 
-           (var-get total-deposits))
-        u0)))
-
 (define-read-only (get-member-deposit-blocks (member principal))
   (get deposit-blocks (default-to 
                         {joined-height: u0, total-deposited: u0, withdrawal-status: false,
                          last-withdrawal-height: u0, deposit-blocks: u0, accumulated-interest: u0,
                          tier: u1, voting-power: u0, last-emergency-withdrawal: u0,
-                         referrer: none, referral-rewards: u0, total-referrals: u0}
+                         referrer: none, referral-rewards: u0, total-referrals: u0,
+                         locked-amount: u0, lock-expiry-height: u0, lock-tier: u0}
                         (map-get? pool-members member))))
 
 (define-read-only (get-pool-info)
@@ -524,6 +606,22 @@
       referral-rewards: (get referral-rewards member-data),
       total-referrals: (get total-referrals member-data),
       referral-rate: (get-referral-rate member-tier)
+    })))
+
+(define-read-only (get-lock-status (member principal))
+  (let ((member-data (unwrap! (map-get? pool-members member) ERR-NOT-MEMBER))
+        (locked-amount (get locked-amount member-data))
+        (lock-expiry (get lock-expiry-height member-data))
+        (lock-tier-value (get lock-tier member-data)))
+    (ok {
+      locked-amount: locked-amount,
+      lock-expiry-height: lock-expiry,
+      lock-tier: lock-tier-value,
+      lock-multiplier: (if (> locked-amount u0) (get-lock-multiplier lock-tier-value) u100),
+      blocks-remaining: (if (> locked-amount u0) 
+                          (if (>= stacks-block-height lock-expiry) u0 (- lock-expiry stacks-block-height))
+                          u0),
+      is-locked: (if (> locked-amount u0) true false)
     })))
 
 ;; === ANALYTICS READ-ONLY FUNCTIONS ===
